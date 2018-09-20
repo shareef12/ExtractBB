@@ -1,6 +1,5 @@
 /**
  * TODO:
- *  - Automatically pull return type from function instead of assuming Int32t
  *  - Move commented debugging code to DEBUG() statements and update README with
  *      debug instructions.
  *  - Integrate pass directly with clang instead of doing a partial compilation
@@ -196,7 +195,7 @@ void extractBasicBlock(Module &M, BBContext &ctx) {
         argsTy.push_back(value->getType());
     }
 
-    IntegerType *retTy = IntegerType::get(M.getContext(), 32);
+    Type *retTy = ctx.BB->getParent()->getReturnType();
     FunctionType *funcTy = FunctionType::get(retTy, argsTy, false);
 
     SmallString<64> funcName(ctx.BB->getParent()->getName());
