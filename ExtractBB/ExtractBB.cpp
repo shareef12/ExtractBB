@@ -1,12 +1,9 @@
 /**
  * TODO:
- *  - Move commented debugging code to DEBUG() statements and update README with
- *      debug instructions.
- *  - Integrate pass directly with clang instead of doing a partial compilation
- *      followed by opt.
- *
- *  - Split basic blocks to create more functions
  *  - Play around with different optimization settings to reduce memory accesses
+ *      - Fix SIGSEGV on -Ox
+ *  - Split basic blocks to create more functions
+ *
  *  - Move alloca uses in a different basic block to the current basic block
  *
  * Not supported:
@@ -19,15 +16,18 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
 #include <cstdlib>
 #include <memory>
+
+#define DEBUG_TYPE "extractbb"
 
 using namespace llvm;
 
@@ -53,17 +53,6 @@ typedef std::map<BasicBlock *, std::unique_ptr<BBContext>> BBMap;
 
 
 /**
- * @brief Print the module IR. Used for debugging.
- */
-void printModule(Module &M)
-{
-    legacy::PassManager PM;
-    PM.add(createPrintModulePass(errs()));
-    PM.run(M);
-}
-
-
-/**
  * @brief Create a BBContext object. Populate params with Values used in the
  *        given basic block.
  *
@@ -79,10 +68,10 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
     ctx->BB = &BB;
     ctx->Func = nullptr;
 
-    //errs() << "  Basic block (name=" << BB.getName() << ") has "
-    //       << BB.size() << " instructions.\n";
+    DEBUG(dbgs() << "  Basic block (name=" << BB.getName() << ") has "
+                 << BB.size() << " instructions.\n");
     for (Instruction &I : BB) {
-        //errs() << "    inst: " << I << "\n";
+        DEBUG(dbgs() << "    inst: " << I << "\n");
 
         // ignore terminator instructions
         if (isa<TerminatorInst>(I)) {
@@ -106,8 +95,8 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
                 }
             }
 
-            //errs() << "      ";
-            //value->dump();
+            DEBUG(dbgs() << "      ");
+            DEBUG(value->dump());
 
             if (ctx->params.count(value) == 0) {
                 ctx->params[value] = std::move(SmallVector<Use *, 4>());
@@ -344,8 +333,8 @@ void fixupArgumentUses(BBContext &ctx) {
  * @param Func Function to extract BasicBlocks from.
  */
 void extractBasicBlocks(Module &M, Function &Func) {
-    //errs() << "extractBasicBlocks(";
-    //errs().write_escaped(Func.getName()) << ")\n";
+    DEBUG(dbgs() << "extractBasicBlocks(");
+    DEBUG(dbgs().write_escaped(Func.getName()) << ")\n");
 
     // split entry block with alloca's into two blocks
     BasicBlock *startBB = &Func.getEntryBlock();
@@ -385,10 +374,10 @@ void extractBasicBlocks(Module &M, Function &Func) {
 }
 
 
-struct Obfuscate : public ModulePass {
+struct ExtractBB : public ModulePass {
     static char ID;
 
-    Obfuscate() : ModulePass(ID) {}
+    ExtractBB() : ModulePass(ID) {}
 
     bool runOnModule(Module &M) override {
         // build the list of functions to extract before extracting them, as
@@ -406,12 +395,22 @@ struct Obfuscate : public ModulePass {
             extractBasicBlocks(M, *Func);
         }
 
-        //printModule(M);
         return false;
     }
 };
 
+static void addExtractBBPass(const PassManagerBuilder &Builder, legacy::PassManagerBase &PM) {
+    PM.add(new ExtractBB());
+}
+
 }   // namespace
 
-char Obfuscate::ID = 0;
-static RegisterPass<Obfuscate> X("extractbb", "Extract Basic Blocks Pass", false, false);
+
+char ExtractBB::ID = 0;
+static RegisterPass<ExtractBB> X("extractbb", "Extract Basic Blocks Pass", false, false);
+
+// automatically register pass when loaded by clang
+static RegisterStandardPasses RegisterExtractBBO0(PassManagerBuilder::EP_EnabledOnOptLevel0,
+                                                  addExtractBBPass);
+static RegisterStandardPasses RegisterExtractBBOx(PassManagerBuilder::EP_OptimizerLast,
+                                                  addExtractBBPass);
