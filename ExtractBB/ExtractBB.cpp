@@ -1,8 +1,7 @@
 /**
  * TODO:
- *  - Play around with different optimization settings to reduce memory accesses
- *  - Add statistics for num BBs extracted
  *  - Split basic blocks to create more functions
+ *  - Check out llvm GraphTraits and utilities for traversing the CFG
  *
  *  - Move alloca uses in a different basic block to the current basic block
  *
@@ -13,6 +12,7 @@
  */
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -28,6 +28,8 @@
 #include <memory>
 
 #define DEBUG_TYPE "extractbb"
+
+STATISTIC(NumBlocksExtracted, "Number of basic blocks extracted");
 
 using namespace llvm;
 
@@ -431,6 +433,8 @@ void extractBasicBlocks(Module &M, Function &Func) {
     for (auto &pair : bbMap) {
         removePhis(*pair.second);
     }
+
+    NumBlocksExtracted += bbMap.size();
 }
 
 
