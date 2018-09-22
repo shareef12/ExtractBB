@@ -1,7 +1,7 @@
 /**
  * TODO:
  *  - Play around with different optimization settings to reduce memory accesses
- *      - Fix SIGSEGV on -Ox
+ *  - Add statistics for num BBs extracted
  *  - Split basic blocks to create more functions
  *
  *  - Move alloca uses in a different basic block to the current basic block
@@ -42,11 +42,16 @@ namespace {
  * @member params A map of values that will become input parameters for the
  *         extracted function. Each parameter maps to a list of Uses in the
  *         extracted function.
+ * @member phis A map of incoming PHINodes for this basic block. Each PHINode
+ *         will become an additional parameter. They need to be tracked
+ *         separately from params because they need special handling and will
+ *         be removed once we're done processing all BasicBlocks.
  */
 struct BBContext {
     BasicBlock *BB;
     Function *Func;
     std::map<Value *, SmallVector<Use *, 4>> params;
+    std::map<PHINode *, SmallVector<Use *, 2>> phis;
 };
 
 typedef std::map<BasicBlock *, std::unique_ptr<BBContext>> BBMap;
@@ -73,8 +78,13 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
     for (Instruction &I : BB) {
         DEBUG(dbgs() << "    inst: " << I << "\n");
 
-        // ignore terminator instructions
-        if (isa<TerminatorInst>(I)) {
+        // PHINodes need special handling. In this case, we have two input
+        // values, but only need one parameter. Add the PHI to the context with
+        // no uses (it will be erased later). We also have to iterate through
+        // the PHINode Users in the current block to properly replace it's
+        // Uses.
+        if (PHINode *phi = dyn_cast<PHINode>(&I)) {
+            ctx->phis[phi] = std::move(SmallVector<Use *, 4>());
             continue;
         }
 
@@ -87,10 +97,17 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
                 continue;
             }
 
-            // values from the same basic block don't need to become
-            // parameters.
+            // Uses of Values that aren't Instructions or Arguments
+            // (BasicBlocks by a BranchInst, Functions by a CallInst), don't
+            // require a parameter.
+            if (!isa<Instruction>(value) && !isa<Argument>(value)) {
+                continue;
+            }
+
+            // Unless it's PHINode, Values from the current BasicBlock don't
+            // need to become parameters.
             if (auto *VI = dyn_cast<Instruction>(value)) {
-                if (VI->getParent() == &BB) {
+                if (!isa<PHINode>(value) && VI->getParent() == &BB) {
                     continue;
                 }
             }
@@ -98,6 +115,15 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
             DEBUG(dbgs() << "      ");
             DEBUG(value->dump());
 
+            // PHINode in the current BasicBlock is tracked separately
+            if (PHINode *phi = dyn_cast<PHINode>(value)) {
+                if (phi->getParent() == &BB) {
+                    ctx->phis[phi].push_back(&U);
+                    continue;
+                }
+            }
+
+            // normal parameter - add it to the param list
             if (ctx->params.count(value) == 0) {
                 ctx->params[value] = std::move(SmallVector<Use *, 4>());
             }
@@ -155,11 +181,18 @@ void visitBasicBlock(BasicBlock &BB,
         // recurse to populate bbMap[succBB]
         visitBasicBlock(**si, bbMap, seenBB);
 
-        // add succ params to this function params. succ params won't have
-        // any Uses associated with them since there is no CallInst yet.
-        std::unique_ptr<BBContext> &succCtx = bbMap[*si];
-        for (auto it : succCtx->params) {
+        // add succ params to this function params if they aren't produced in
+        // this BasicBlock. succ params won't have any Uses associated with
+        // them since there is no CallInst yet.
+        BBContext *succCtx = bbMap[*si].get();
+        for (auto &it : succCtx->params) {
             Value *value = it.first;
+            if (Instruction *I = dyn_cast<Instruction>(value)) {
+                if (I->getParent() == &BB) {
+                    continue;
+                }
+            }
+
             if (ctx->params.count(value) == 0) {
                 ctx->params[value] = std::move(SmallVector<Use *, 4>());
             }
@@ -179,18 +212,19 @@ void visitBasicBlock(BasicBlock &BB,
 void extractBasicBlock(Module &M, BBContext &ctx) {
     // create the function
     SmallVector<Type *, 8> argsTy;
-    for (auto it : ctx.params) {
+    for (auto &it : ctx.params) {
         Value *value = it.first;
         argsTy.push_back(value->getType());
+    }
+    for (auto &it : ctx.phis) {
+        PHINode *phi = it.first;
+        argsTy.push_back(phi->getType());
     }
 
     Type *retTy = ctx.BB->getParent()->getReturnType();
     FunctionType *funcTy = FunctionType::get(retTy, argsTy, false);
-
-    SmallString<64> funcName(ctx.BB->getParent()->getName());
-    funcName.append("_extracted_");
-    funcName.append(ctx.BB->getName());
-    ctx.Func = Function::Create(funcTy, GlobalValue::InternalLinkage, funcName.str(), &M);
+    Twine funcName = ctx.BB->getParent()->getName() + "_extracted_" + ctx.BB->getName();
+    ctx.Func = Function::Create(funcTy, GlobalValue::InternalLinkage, funcName, &M);
 
     // move the basic block to the new function
     ctx.BB->removeFromParent();
@@ -200,29 +234,37 @@ void extractBasicBlock(Module &M, BBContext &ctx) {
 
 /**
  * @brief Helper function to create a CallInst to an extracted BasicBlock.
+ * @param BB Original BasicBlock that is being modified.
  * @param builder IRBuilder that should be used to insert instructions.
  * @param ctx Context for the current extracted function. This can be nullptr
  *        if the current function is not an extracted BasicBlock.
  * @param targetCtx Context representing the extracted BasicBlock that should
  *        be used as the call target.
  */
-CallInst * createCallInst(IRBuilder<> &builder, BBContext *ctx,
-                          std::unique_ptr<BBContext> &targetCtx) {
+CallInst * createCallInst(BasicBlock &BB, IRBuilder<> &builder, BBContext *ctx,
+                          BBContext &targetCtx) {
     // build argument array for the call from the child
     SmallVector<Value *, 8> args;
-    for (auto it : targetCtx->params) {
+    for (auto &it : targetCtx.params) {
         Value *value = it.first;
         args.push_back(value);
     }
+    for (auto &it : targetCtx.phis) {
+        PHINode *phi = it.first;
+        Value *arg = phi->getIncomingValueForBlock(&BB);
+        args.push_back(arg);
+    }
 
-    CallInst *callInst = builder.CreateCall(targetCtx->Func, args);
+    CallInst *callInst = builder.CreateCall(targetCtx.Func, args);
 
     // if this BasicBlock was extracted, add the new uses to the list
     // of uses for the arguments so it can be properly replaced later.
     if (ctx != nullptr) {
         for (Use &U : callInst->arg_operands()) {
             Value *value = U.get();
-            ctx->params[value].push_back(&U);
+            if (ctx->params.count(value) > 0) {
+                ctx->params[value].push_back(&U);
+            }
         }
     }
 
@@ -266,7 +308,7 @@ void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
             BasicBlock *succ = branch->getSuccessor(0);
 
             IRBuilder<> builder(term);
-            CallInst *callInst = createCallInst(builder, ctx, bbMap[succ]);
+            CallInst *callInst = createCallInst(BB, builder, ctx, *bbMap[succ]);
             builder.CreateRet(callInst);
             term->eraseFromParent();
             return;
@@ -275,19 +317,21 @@ void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
             // handle multi target branch
             BasicBlock *succ0 = branch->getSuccessor(0);
             BasicBlock *succ1 = branch->getSuccessor(1);
-            BasicBlock *bb0 = BasicBlock::Create(BB.getContext(), succ0->getName(), BB.getParent());
-            BasicBlock *bb1 = BasicBlock::Create(BB.getContext(), succ1->getName(), BB.getParent());
+            BasicBlock *bb0 = BasicBlock::Create(BB.getContext(), "call_" + succ0->getName(),
+                                                 BB.getParent());
+            BasicBlock *bb1 = BasicBlock::Create(BB.getContext(), "call_" + succ1->getName(),
+                                                 BB.getParent());
             BasicBlock *bb2 = BasicBlock::Create(BB.getContext(), "retblock", BB.getParent());
 
             branch->setSuccessor(0, bb0);
             branch->setSuccessor(1, bb1);
 
             IRBuilder <> builder(bb0);
-            CallInst *callInst0 = createCallInst(builder, ctx, bbMap[succ0]);
+            CallInst *callInst0 = createCallInst(BB, builder, ctx, *bbMap[succ0]);
             builder.CreateBr(bb2);
 
             builder.SetInsertPoint(bb1);
-            CallInst *callInst1 = createCallInst(builder, ctx, bbMap[succ1]);
+            CallInst *callInst1 = createCallInst(BB, builder, ctx, *bbMap[succ1]);
             builder.CreateBr(bb2);
 
             builder.SetInsertPoint(bb2);
@@ -315,7 +359,7 @@ void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
  */
 void fixupArgumentUses(BBContext &ctx) {
     auto ai = ctx.Func->arg_begin();
-    for (auto it : ctx.params) {
+    for (auto &it : ctx.params) {
         Value *value = it.first;
         Argument &arg = *ai;
         arg.setName(value->getName());
@@ -323,6 +367,27 @@ void fixupArgumentUses(BBContext &ctx) {
             U->set(&arg);
         }
         ai++;
+    }
+    for (auto &it : ctx.phis) {
+        PHINode *phi = it.first;
+        Argument &arg = *ai;
+        arg.setName(phi->getName());
+        for (Use *U : it.second) {
+            U->set(&arg);
+        }
+        ai++;
+    }
+}
+
+
+/**
+ * @brief Remove PHINodes that were replaced with parameters.
+ * @param ctx Context for the current extracted BasicBlock.
+ */
+void removePhis(BBContext &ctx) {
+    for (auto &it : ctx.phis) {
+        PHINode *phi = it.first;
+        phi->eraseFromParent();
     }
 }
 
@@ -336,21 +401,11 @@ void extractBasicBlocks(Module &M, Function &Func) {
     DEBUG(dbgs() << "extractBasicBlocks(");
     DEBUG(dbgs().write_escaped(Func.getName()) << ")\n");
 
-    // split entry block with alloca's into two blocks
-    BasicBlock *startBB = &Func.getEntryBlock();
-    bool containsAlloca = false;
-    for (Instruction &I : *startBB) {
-        if (isa<AllocaInst>(I)) {
-            containsAlloca = true;
-        }
-        else if (containsAlloca) {
-            startBB = startBB->splitBasicBlock(&I);
-            break;
-        }
-        else {
-            break;
-        }
-    }
+    // split entry block into two blocks. the entry block should not be
+    // extracted, but we need to ensure an unconditional jump to the first
+    // extracted block to make the postorder traversal easier (single root)
+    BasicBlock &entryBB = Func.getEntryBlock();
+    BasicBlock *startBB = entryBB.splitBasicBlock(entryBB.getTerminator());
 
     // Pass 1: Recursive postorder traversal of the CFG to determine
     // parameters needed for each extracted BasicBlock.
@@ -366,10 +421,15 @@ void extractBasicBlocks(Module &M, Function &Func) {
     }
 
     // Pass 3: Fixup BasicBlock transitions by converting branches to calls
-    fixupTerminator(Func.getEntryBlock(), nullptr, bbMap);
+    fixupTerminator(entryBB, nullptr, bbMap);
     for (auto &pair : bbMap) {
         fixupTerminator(*pair.second->BB, pair.second.get(), bbMap);
         fixupArgumentUses(*pair.second);
+    }
+
+    // Pass 4: Remove PHINodes that were replaced with parameters
+    for (auto &pair : bbMap) {
+        removePhis(*pair.second);
     }
 }
 
