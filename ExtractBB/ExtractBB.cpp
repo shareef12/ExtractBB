@@ -1,11 +1,13 @@
 /**
- * TODO:
- *  - Split basic blocks to create more functions
- *  - Check out llvm GraphTraits and utilities for traversing the CFG
+ * @brief Module pass to extract instructions into functions.
  *
- *  - Move alloca uses in a different basic block to the current basic block
+ * This pass will individually process each function, extracting instructions
+ * into new functions. Edges between instructions and basic blocks will be
+ * converted into calls. As a side-effect of this, loops will be translated
+ * into recursive calls.
  *
- * Not supported:
+ * At the moment, the only supported Terminator instructions for BasicBlocks
+ * are returns and branches. The following terminators are not implemented:
  *  - switch statements
  *  - indirect branches
  *  - exceptions/cleanup
@@ -57,6 +59,19 @@ struct BBContext {
 };
 
 typedef std::map<BasicBlock *, std::unique_ptr<BBContext>> BBMap;
+
+
+/**
+ * @brief Split a BasicBlock after the first insertion point.
+ * @param BB BasicBlock to split.
+ */
+void splitBasicBlock(BasicBlock &BB) {
+    auto it = BB.getFirstInsertionPt();
+    if (it == BB.end() || std::next(it) == BB.end()) {
+        return;
+    }
+    BB.splitBasicBlock(std::next(it));
+}
 
 
 /**
@@ -199,6 +214,22 @@ void visitBasicBlock(BasicBlock &BB,
                 ctx->params[value] = std::move(SmallVector<Use *, 4>());
             }
         }
+
+        // if the succ has PHINodes that depend on a Value produced by one of
+        // our parent BasicBlocks, that Value needs to become a parameter.
+        for (auto &it : succCtx->phis) {
+            PHINode *phi = it.first;
+            Value *value = phi->getIncomingValueForBlock(&BB);
+            if (Instruction *I = dyn_cast<Instruction>(value)) {
+                if (I->getParent() == &BB) {
+                    continue;
+                }
+            }
+
+            if (ctx->params.count(value) == 0) {
+                ctx->params[value] = std::move(SmallVector<Use *, 4>());
+            }
+        }
     }
 
     seenBB.erase(&BB);
@@ -266,6 +297,11 @@ CallInst * createCallInst(BasicBlock &BB, IRBuilder<> &builder, BBContext *ctx,
             Value *value = U.get();
             if (ctx->params.count(value) > 0) {
                 ctx->params[value].push_back(&U);
+            }
+            else if (PHINode *phi = dyn_cast<PHINode>(value)) {
+                if (ctx->phis.count(phi) > 0) {
+                    ctx->phis[phi].push_back(&U);
+                }
             }
         }
     }
@@ -403,33 +439,42 @@ void extractBasicBlocks(Module &M, Function &Func) {
     DEBUG(dbgs() << "extractBasicBlocks(");
     DEBUG(dbgs().write_escaped(Func.getName()) << ")\n");
 
-    // split entry block into two blocks. the entry block should not be
-    // extracted, but we need to ensure an unconditional jump to the first
-    // extracted block to make the postorder traversal easier (single root)
-    BasicBlock &entryBB = Func.getEntryBlock();
-    BasicBlock *startBB = entryBB.splitBasicBlock(entryBB.getTerminator());
+    // add a dummy BasicBlock as the function entry block that only branches
+    // to the true entry block. this will ensure we have a single BasicBlock
+    // that will be the root node for the postorder traversal.
+    BasicBlock &startBB = Func.getEntryBlock();
+    BasicBlock *entryBB = BasicBlock::Create(Func.getContext(), "entry", &Func, &startBB);
+    IRBuilder<> builder(entryBB);
+    builder.CreateBr(&startBB);
 
-    // Pass 1: Recursive postorder traversal of the CFG to determine
-    // parameters needed for each extracted BasicBlock.
+    // Pass 1: Split BasicBlocks into blocks with a single Instruction
+    for (BasicBlock &BB : Func) {
+        splitBasicBlock(BB);
+    }
+
+    // Pass 2: Recursive postorder traversal of the CFG to determine
+    // parameters needed for each extracted BasicBlock. Two iterations are
+    // required to handle loops.
     BBMap bbMap;
     SmallPtrSet<BasicBlock *, 32> seenBB;
     for (int i = 0; i < 2; i++) {
-        visitBasicBlock(*startBB, bbMap, seenBB);
+        visitBasicBlock(startBB, bbMap, seenBB);
     }
 
-    // Pass 2: Extract BasicBlocks into new functions
+    // Pass 3: Extract BasicBlocks into new functions
     for (auto &pair : bbMap) {
         extractBasicBlock(M, *pair.second);
     }
 
-    // Pass 3: Fixup BasicBlock transitions by converting branches to calls
-    fixupTerminator(entryBB, nullptr, bbMap);
+    // Pass 4: Fixup BasicBlock transitions by converting branches to calls
+    fixupTerminator(*entryBB, nullptr, bbMap);
     for (auto &pair : bbMap) {
         fixupTerminator(*pair.second->BB, pair.second.get(), bbMap);
         fixupArgumentUses(*pair.second);
     }
 
-    // Pass 4: Remove PHINodes that were replaced with parameters
+
+    // Pass 5: Remove PHINodes that were replaced with parameters
     for (auto &pair : bbMap) {
         removePhis(*pair.second);
     }
@@ -448,9 +493,9 @@ struct ExtractBB : public ModulePass {
         // we will be adding extracted functions to the module as we go.
         SmallVector<Function *, 32> functions;
         for (Function &Func : M) {
-            // only extract BasicBlocks if the function contains more than one
+            // only extract BasicBlocks if the function contains at least one
             // BasicBlock. external functions will have 0 BasicBlocks.
-            if (Func.size() > 1) {
+            if (!Func.empty()) {
                 functions.push_back(&Func);
             }
         }
@@ -471,7 +516,7 @@ static void addExtractBBPass(const PassManagerBuilder &Builder, legacy::PassMana
 
 
 char ExtractBB::ID = 0;
-static RegisterPass<ExtractBB> X("extractbb", "Extract Basic Blocks Pass", false, false);
+static RegisterPass<ExtractBB> X("extractbb", "Extract Basic Blocks", false, false);
 
 // automatically register pass when loaded by clang
 static RegisterStandardPasses RegisterExtractBBO0(PassManagerBuilder::EP_EnabledOnOptLevel0,
