@@ -347,7 +347,12 @@ void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
 
             IRBuilder<> builder(term);
             CallInst *callInst = createCallInst(BB, builder, ctx, *bbMap[succ]);
-            builder.CreateRet(callInst);
+            if (callInst->getCalledFunction()->getReturnType()->isVoidTy()) {
+                builder.CreateRetVoid();
+            }
+            else {
+                builder.CreateRet(callInst);
+            }
             term->eraseFromParent();
             return;
         }
@@ -373,10 +378,16 @@ void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
             builder.CreateBr(bb2);
 
             builder.SetInsertPoint(bb2);
-            PHINode *phi = builder.CreatePHI(callInst0->getCalledFunction()->getReturnType(), 4);
-            phi->addIncoming(callInst0, bb0);
-            phi->addIncoming(callInst1, bb1);
-            builder.CreateRet(phi);
+            Type *retTy = callInst0->getCalledFunction()->getReturnType();
+            if (retTy->isVoidTy()) {
+                builder.CreateRetVoid();
+            }
+            else {
+                PHINode *phi = builder.CreatePHI(retTy, 2);
+                phi->addIncoming(callInst0, bb0);
+                phi->addIncoming(callInst1, bb1);
+                builder.CreateRet(phi);
+            }
 
             return;
         }
