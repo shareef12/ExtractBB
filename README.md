@@ -10,5 +10,6 @@
     opt-6.0 -load build/lib/LLVMExtractBB.so -extractbb test.bc > test_opt.bc
     opt-6.0 -debug -load release_601/build/lib/LLVMExtractBB.so -extractbb test.bc > test_opt.bc
     opt-6.0 -debug-only=extractbb -load release_601/build/lib/LLVMExtractBB.so -extractbb test.bc > test_opt.bc
+    opt-6.0 --time-passes -load release_601/build/lib/LLVMExtractBB.so -extractbb test.bc > test_opt.bc
     opt-6.0 --debug-pass=Structure -load build/lib/LLVMExtractBB.so -extractbb test.bc > test_opt.bc
     clang-6.0 test_opt.bc

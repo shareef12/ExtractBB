@@ -61,6 +61,7 @@ struct BBContext {
 typedef std::map<BasicBlock *, std::unique_ptr<BBContext>> BBMap;
 
 
+#if defined(SPLIT_BASICBLOCKS)
 /**
  * @brief Split a BasicBlock after the first insertion point.
  * @param BB BasicBlock to split.
@@ -72,6 +73,7 @@ void splitBasicBlock(BasicBlock &BB) {
     }
     BB.splitBasicBlock(std::next(it));
 }
+#endif  // SPLIT_BASICBLOCKS
 
 
 /**
@@ -458,10 +460,12 @@ void extractBasicBlocks(Module &M, Function &Func) {
     IRBuilder<> builder(entryBB);
     builder.CreateBr(&startBB);
 
+#if defined(SPLIT_BASICBLOCKS)
     // Pass 1: Split BasicBlocks into blocks with a single Instruction
     for (BasicBlock &BB : Func) {
         splitBasicBlock(BB);
     }
+#endif  // SPLIT_BASICBLOCKS
 
     // Pass 2: Recursive postorder traversal of the CFG to determine
     // parameters needed for each extracted BasicBlock. Two iterations are
