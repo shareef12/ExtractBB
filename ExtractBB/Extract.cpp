@@ -161,7 +161,7 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
  * Since we're doing a postorder traversal in a graph that may have loops,
  * there's no way to have a complete answer if a loop is detected (since the
  * already seen successor hasn't been populated yet). To fix this, the
- * traversal must be performed at least twice.
+ * traversal must be performed until this function returns false.
  *
  * @param BB Current BasicBlock to process.
  * @param bbMap Map of all BasicBlocks to their contexts. The goal of the
@@ -169,36 +169,45 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
  * @param seenBB A set of all BasicBlocks seen so far during this recursive
  *        iteration. This variable is used to detect loops in the CFG and
  *        prevent infinite recursion.
+ * @return true if any modifications were made to the bbMap. This function
+ *         should be repeatedly called while true is returned in order to
+ *         properly handle loops in the CFG.
  */
-void visitBasicBlock(BasicBlock &BB,
+bool visitBasicBlock(BasicBlock &BB,
                      BBMap &bbMap,
                      SmallPtrSet<BasicBlock *, 32> &seenBB) {
     // base case 1: BB terminator is a function terminator
     if (isa<ReturnInst>(BB.getTerminator())) {
+        bool retval = false;
         if (bbMap.count(&BB) == 0) {
             bbMap[&BB] = createBBContext(BB);
+            retval = true;
         }
 
         seenBB.erase(&BB);
-        return;
+        return retval;
     }
 
     // base case 2: loop detected
     if (seenBB.count(&BB) > 0) {
-        return;
+        return false;
     }
 
     // recursive case: recurse to get params of children, then populate current
     // block.
+    bool retval = false;
     seenBB.insert(&BB);
     if (bbMap.count(&BB) == 0) {
         bbMap[&BB] = createBBContext(BB);
+        retval = true;
     }
-    std::unique_ptr<BBContext> &ctx = bbMap[&BB];
+    BBContext &ctx = *bbMap[&BB];
 
     for (succ_iterator si = succ_begin(&BB), se = succ_end(&BB); si != se; si++) {
         // recurse to populate bbMap[succBB]
-        visitBasicBlock(**si, bbMap, seenBB);
+        if (visitBasicBlock(**si, bbMap, seenBB)) {
+            retval = true;
+        }
 
         // add succ params to this function params if they aren't produced in
         // this BasicBlock. succ params won't have any Uses associated with
@@ -212,8 +221,9 @@ void visitBasicBlock(BasicBlock &BB,
                 }
             }
 
-            if (ctx->params.count(value) == 0) {
-                ctx->params[value] = std::move(SmallVector<Use *, 4>());
+            if (ctx.params.count(value) == 0) {
+                ctx.params[value] = std::move(SmallVector<Use *, 4>());
+                retval = true;
             }
         }
 
@@ -228,13 +238,15 @@ void visitBasicBlock(BasicBlock &BB,
                 }
             }
 
-            if (ctx->params.count(value) == 0) {
-                ctx->params[value] = std::move(SmallVector<Use *, 4>());
+            if (ctx.params.count(value) == 0) {
+                ctx.params[value] = std::move(SmallVector<Use *, 4>());
+                retval = true;
             }
         }
     }
 
     seenBB.erase(&BB);
+    return retval;
 }
 
 
@@ -472,8 +484,8 @@ void extractBasicBlocks(Module &M, Function &Func) {
     // required to handle loops.
     BBMap bbMap;
     SmallPtrSet<BasicBlock *, 32> seenBB;
-    for (int i = 0; i < 2; i++) {
-        visitBasicBlock(startBB, bbMap, seenBB);
+    while (visitBasicBlock(startBB, bbMap, seenBB)) {
+        ;
     }
 
     // Pass 3: Extract BasicBlocks into new functions
