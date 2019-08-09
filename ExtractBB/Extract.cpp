@@ -11,6 +11,10 @@
  *  - switch statements
  *  - indirect branches
  *  - exceptions/cleanup
+ *
+ * TODO:
+ *  - Propagate local variables down to the lowest level to hinder function
+ *      start detection.
  */
 
 #include "llvm/ADT/SmallPtrSet.h"
@@ -209,7 +213,7 @@ bool visitBasicBlock(BasicBlock &BB,
             retval = true;
         }
 
-        // add succ params to this function params if they aren't produced in
+        // add succ params to this function's params if they aren't produced in
         // this BasicBlock. succ params won't have any Uses associated with
         // them since there is no CallInst yet.
         BBContext *succCtx = bbMap[*si].get();
@@ -480,8 +484,8 @@ void extractBasicBlocks(Module &M, Function &Func) {
 #endif  // SPLIT_BASICBLOCKS
 
     // Pass 2: Recursive postorder traversal of the CFG to determine
-    // parameters needed for each extracted BasicBlock. Two iterations are
-    // required to handle loops.
+    // parameters needed for each extracted BasicBlock. Multiple iterations
+    // may be required to handle loops.
     BBMap bbMap;
     SmallPtrSet<BasicBlock *, 32> seenBB;
     while (visitBasicBlock(startBB, bbMap, seenBB)) {
