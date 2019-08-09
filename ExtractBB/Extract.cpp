@@ -92,10 +92,10 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
     ctx->BB = &BB;
     ctx->Func = nullptr;
 
-    DEBUG(dbgs() << "  Basic block (name=" << BB.getName() << ") has "
+    LLVM_DEBUG(dbgs() << "  Basic block (name=" << BB.getName() << ") has "
                  << BB.size() << " instructions.\n");
     for (Instruction &I : BB) {
-        DEBUG(dbgs() << "    inst: " << I << "\n");
+        LLVM_DEBUG(dbgs() << "    inst: " << I << "\n");
 
         // PHINodes need special handling. In this case, we have two input
         // values, but only need one parameter. Add the PHI to the context with
@@ -131,8 +131,8 @@ std::unique_ptr<BBContext> createBBContext(BasicBlock &BB) {
                 }
             }
 
-            DEBUG(dbgs() << "      ");
-            DEBUG(value->dump());
+            LLVM_DEBUG(dbgs() << "      ");
+            LLVM_DEBUG(value->dump());
 
             // PHINode in the current BasicBlock is tracked separately
             if (PHINode *phi = dyn_cast<PHINode>(value)) {
@@ -349,7 +349,7 @@ CallInst * createCallInst(BasicBlock &BB, IRBuilder<> &builder, BBContext *ctx,
  */
 void fixupTerminator(BasicBlock &BB, BBContext *ctx, BBMap &bbMap)
 {
-    TerminatorInst *term = BB.getTerminator();
+    Instruction *term = BB.getTerminator();
     if (isa<ReturnInst>(term) || isa<UnreachableInst>(term)) {
         return;
     }
@@ -461,8 +461,8 @@ void removePhis(BBContext &ctx) {
  * @param Func Function to extract BasicBlocks from.
  */
 void extractBasicBlocks(Module &M, Function &Func) {
-    DEBUG(dbgs() << "extractBasicBlocks(");
-    DEBUG(dbgs().write_escaped(Func.getName()) << ")\n");
+    LLVM_DEBUG(dbgs() << "extractBasicBlocks(");
+    LLVM_DEBUG(dbgs().write_escaped(Func.getName()) << ")\n");
 
     // add a dummy BasicBlock as the function entry block that only branches
     // to the true entry block. this will ensure we have a single BasicBlock
